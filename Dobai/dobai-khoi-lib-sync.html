@@ -1,0 +1,250 @@
+<script id="lib-sync">
+/* ===== lib-sync: đồng bộ Kho thư viện (dc-lib) qua kho trung gian dc-libsync — cfsync.js đưa kho này lên Cloudflare ===== */
+(function () {
+  'use strict';
+  const W = window, D = document;
+  const $ = id => D.getElementById(id);
+  const say = m => { try { if (typeof toast === 'function') toast(m); } catch (e) {} };
+  const DB = 'dc-libsync', ST = 'kv';
+  const PER_LIB_MAX = 4 * 1048576, TOTAL_MAX = 24 * 1048576;   // mỗi thư viện / tổng (byte)
+  const STYLE_LIB = 'ae-styles-user';
+  const META_KEYS =['ae_style', 'ae_profile', 'ae_auto'], META_ID = 'meta:ae';
+  const S = { on: true, running: false, again: 0, applying: false, last: 0, pushed: 0, pulled: 0, deleted: 0, skipped: [], errs: [], sig: null, mh: null, tm: 0 };
+  let LX = null;
+
+  function waitReady(pred, cb, onFail) {
+    if (pred()) { cb(); return; }
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (pred()) { clearInterval(iv); cb(); }
+      else if (Date.now() - t0 >= 3000) { clearInterval(iv); if (onFail) onFail(); }
+    }, 100);
+  }
+  const loggedIn = () => { try { return !!(W.CFS && W.CFS.user); } catch (e) { return false; } };
+  function h53(str) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+
+  /* ---------- IndexedDB dc-libsync/kv (cùng cấu trúc cfsync.js mở: version 1, không keyPath) ---------- */
+  const openDb = () => new Promise((ok, no) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains(ST)) r.result.createObjectStore(ST); };
+    r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); r.onblocked = () => no(new Error('blocked'));
+  });
+  async function idbAll() {
+    const db = await openDb();
+    try {
+      return await new Promise((ok, no) => {
+        const out = new Map(), q = db.transaction(ST, 'readonly').objectStore(ST).openCursor();
+        q.onsuccess = () => { const c = q.result; if (c) { out.set(c.key, c.value); c.continue(); } else ok(out); };
+        q.onerror = () => no(q.error);
+      });
+    } finally { db.close(); }
+  }
+  async function idbPut(key, val) {
+    const db = await openDb();
+    try { await new Promise((ok, no) => { const t = db.transaction(ST, 'readwrite'); t.objectStore(ST).put(val, key); t.oncomplete = ok; t.onerror = t.onabort = () => no(t.error); }); } finally { db.close(); }
+  }
+  async function idbDel(key) {
+    const db = await openDb();
+    try { await new Promise((ok, no) => { const t = db.transaction(ST, 'readwrite'); t.objectStore(ST).delete(key); t.oncomplete = ok; t.onerror = t.onabort = () => no(t.error); }); } finally { db.close(); }
+  }
+  const sigOf = m => Array.from(m.entries()).map(([k, v]) => k + ':' + (v && v.h)).sort().join('|');
+
+  /* ---------- ảnh chụp kho trên máy này ---------- */
+  // Băm chỉ lấy nội dung (bỏ updatedAt/lastUsed/pinned) để nhập xong không bị coi là "đã sửa"
+  function libHash(lib, ch, brief) {
+    const parts = ch.map(c => (c.kind || '') + '\u0001' + (c.title || '') + '\u0001' + h53(String(c.text || ''))).sort();
+    return h53(JSON.stringify([lib.id, lib.name, lib.version, lib.url, lib.license, lib.summary, lib.tags || [], brief || '', parts]));
+  }
+  async function metaObj() {
+    const obj = {};
+    for (const k of META_KEYS) { try { const v = await LX._.metaGet(k, undefined); if (v !== undefined) obj[k] = v; } catch (e) {} }
+    return obj;
+  }
+  async function snapshot() {
+    const map = new Map(), skipped = [];
+    const exp = JSON.parse(await LX.export());
+    const by = new Map();
+    (exp.chunks || []).forEach(c => { if (!c || !c.lib) return; if (!by.has(c.lib)) by.set(c.lib, []); by.get(c.lib).push(c); });
+    const libs = (exp.libs || []).filter(l => l && l.id && !l.builtin).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    let total = 0;
+    for (const lib of libs) {
+      const ch = by.get(lib.id) || [];
+      let brief = '';
+      if (String(lib.id).indexOf('dx-') === 0) { try { brief = String(await LX._.metaGet('dx_brief:' + lib.id, '') || ''); } catch (e) {} }
+      const str = JSON.stringify({ version: 1, libs: [lib], chunks: ch });
+      const size = LX._.byteLen(str) + brief.length;
+      if (size > PER_LIB_MAX || total + size > TOTAL_MAX) { skipped.push(lib.id); continue; }
+      total += size;
+      map.set('lib:' + lib.id, { kind: 'lib', id: lib.id, hash: libHash(lib, ch, brief), updatedAt: lib.updatedAt || 0, size, str, brief });
+    }
+    const obj = await metaObj();
+    if (Object.keys(obj).length) { const j = JSON.stringify(obj); map.set(META_ID, { kind: 'meta', id: META_ID, hash: h53(j), updatedAt: Date.now(), size: j.length, obj }); }
+    return { map, skipped };
+  }
+
+  /* ---------- đẩy / nhận / xóa một mục ---------- */
+  async function putRemote(key, L) {
+    if (L.kind === 'meta') { await idbPut(key, { v: 1, kind: 'meta', id: L.id, updatedAt: L.updatedAt, h: L.hash, size: L.size, obj: L.obj }); return; }
+    await idbPut(key, { v: 1, kind: 'lib', id: L.id, updatedAt: L.updatedAt, h: L.hash, size: L.size, brief: L.brief || '', data: new Blob([L.str], { type: 'application/json' }) });
+  }
+  async function applyRemote(key, R) {
+    if (!R) return;
+    if (R.kind === 'meta') {
+      const o = R.obj && typeof R.obj === 'object' ? R.obj : {};
+      for (const k of META_KEYS) if (k in o) await LX._.metaSet(k, o[k]);
+      return;
+    }
+    let txt = '';
+    if (R.data && typeof R.data.text === 'function') txt = await R.data.text();
+    else if (R.data instanceof ArrayBuffer) txt = new TextDecoder().decode(R.data);
+    let obj; try { obj = JSON.parse(txt); } catch (e) { throw new Error('dữ liệu thư viện hỏng'); }
+    if (!obj || !Array.isArray(obj.libs) || obj.libs.length !== 1 || obj.libs[0].id !== R.id) throw new Error('dữ liệu thư viện không khớp');
+    obj.libs[0].builtin = false;
+    S.applying = true;
+    try {
+      await LX.import(obj);
+      if (R.brief) { try { await LX._.metaSet('dx_brief:' + R.id, String(R.brief)); } catch (e) {} }
+    } finally { S.applying = false; }
+    if (R.id === STYLE_LIB) await refreshStyles();
+  }
+  async function removeLocal(key) {
+    if (key.indexOf('lib:') !== 0) return;
+    S.applying = true;
+    try { await LX.remove(key.slice(4), { force: true }); } finally { S.applying = false; }
+    if (key === 'lib:' + STYLE_LIB) await refreshStyles();
+  }
+  // ae-core nạp phong cách tự tạo vào bộ nhớ đệm một lần; sau khi nhận/xóa thư viện đó phải làm mới đệm (thêm trước, xóa sau để không mất dữ liệu)
+  async function refreshStyles() {
+    if (!LX.style || !LX.style.list || !LX.style.set || !LX.style.remove) return;
+    S.applying = true;
+    try {
+      const hits = await LX.search('', { lib: STYLE_LIB, kind: 'style', k: 100, maxTokens: 999999 });
+      const want = new Map();
+      hits.forEach(h => { try { const o = JSON.parse(h.text); if (o && o.id && !o.builtin) want.set(o.id, o); } catch (e) {} });
+      for (const o of want.values()) await LX.style.set(o);
+      for (const s of await LX.style.list()) if (!s.builtin && !want.has(s.id)) await LX.style.remove(s.id);
+    } catch (e) { S.errs.push('phong cách: ' + ((e && e.message) || e)); }
+    finally { S.applying = false; }
+  }
+
+  /* ---------- đối chiếu ba bên: máy này / đám mây (dc-libsync) / lần đồng bộ trước (sync_known) ---------- */
+  async function reconcile(opts) {
+    opts = opts || {};
+    if (!LX) return { skipped: 'Kho thư viện chưa sẵn sàng' };
+    if (!S.on && !opts.force) return { skipped: 'đang tắt' };
+    if (!loggedIn()) return { skipped: 'chưa đăng nhập' };
+    if (S.running) { S.again = Math.min(2, S.again + 1); return { skipped: 'đang chạy' }; }
+    S.running = true; S.errs = [];
+    let pushed = 0, pulled = 0, deleted = 0;
+    try {
+      const known = (await LX._.metaGet('sync_known', {})) || {};
+      const remote = await idbAll();
+      const snap = await snapshot();
+      const skipKeys = new Set(snap.skipped.map(id => 'lib:' + id));
+      const nk = {};
+      const keys = new Set([].concat(Array.from(snap.map.keys()), Array.from(remote.keys()), Object.keys(known)));
+      for (const key of keys) {
+        if (skipKeys.has(key)) { if (known[key] != null) nk[key] = known[key]; continue; }
+        const Lr = snap.map.get(key), Rr = remote.get(key);
+        const L = Lr ? Lr.hash : null, R = Rr && Rr.h != null ? Rr.h : null, B = known[key];
+        let act;
+        if (L === R) act = 'same';
+        else if (B === undefined) act = L == null ? 'pull' : R == null ? 'push' : ((Lr.updatedAt || 0) >= ((Rr && Rr.updatedAt) || 0) ? 'push' : 'pull');
+        else if (L === B) act = R == null ? 'dellocal' : 'pull';
+        else if (R === B) act = L == null ? 'delremote' : 'push';
+        else act = L == null ? 'pull' : R == null ? 'push' : ((Lr.updatedAt || 0) >= ((Rr && Rr.updatedAt) || 0) ? 'push' : 'pull');
+        try {
+          if (act === 'same') { if (L != null) nk[key] = L; }
+          else if (act === 'push') { await putRemote(key, Lr); nk[key] = L; pushed++; }
+          else if (act === 'pull') { await applyRemote(key, Rr); nk[key] = R; pulled++; }
+          else if (act === 'dellocal') { await removeLocal(key); deleted++; }
+          else if (act === 'delremote') { await idbDel(key); deleted++; }
+        } catch (e) {
+          S.errs.push(key + ': ' + ((e && e.message) || e));
+          if (B !== undefined) nk[key] = B;
+        }
+      }
+      await LX._.metaSet('sync_known', nk);
+      S.skipped = snap.skipped; S.pushed += pushed; S.pulled += pulled; S.deleted += deleted; S.last = Date.now();
+      try { S.sig = sigOf(await idbAll()); S.mh = h53(JSON.stringify(await metaObj())); } catch (e) {}
+      paint();
+      return { pushed, pulled, deleted, skipped: snap.skipped, errs: S.errs.slice() };
+    } catch (e) {
+      S.errs.push((e && e.message) || String(e)); paint();
+      return { errs: S.errs.slice() };
+    } finally {
+      S.running = false;
+      if (S.again > 0) { S.again--; schedule(1500); }
+    }
+  }
+  function schedule(ms) { clearTimeout(S.tm); S.tm = setTimeout(() => { reconcile().catch(() => {}); }, ms); }
+
+  /* ---------- dòng trạng thái trong thẻ "Kho thư viện & thẩm mỹ" ---------- */
+  const hhmm = t => { try { return new Date(t).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } };
+  function statusText() {
+    if (!S.on) return '🔄 Đồng bộ kho: đang tắt.';
+    if (!loggedIn()) return '🔄 Đồng bộ kho: đăng nhập tài khoản để bật (☁ Tài khoản).';
+    let t = '🔄 Đồng bộ kho: bật' + (S.last ? ' · lần cuối ' + hhmm(S.last) + ' (gửi ' + S.pushed + ', nhận ' + S.pulled + ')' : ' · chưa chạy');
+    if (S.skipped.length) t += ' · bỏ qua ' + S.skipped.length + ' gói quá lớn';
+    if (S.errs.length) t += ' · lỗi ' + S.errs.length;
+    return t;
+  }
+  function paint() { const el = $('lbs-st'); if (el) el.textContent = statusText(); const b = $('lbs-tg'); if (b) b.textContent = S.on ? 'Tắt đồng bộ' : 'Bật đồng bộ'; }
+  function addRow() {
+    try {
+      const card = $('lbx-entry'); if (!card || $('lbs-row')) return;
+      const row = D.createElement('div'); row.id = 'lbs-row'; row.style.cssText = 'margin-top:10px';
+      row.innerHTML = '<p id="lbs-st" style="margin:0 0 8px;font-size:12px;color:var(--mute);line-height:1.4"></p>'
+        + '<button type="button" class="st-btn" data-lbs-act="now">🔄 Đồng bộ ngay</button> <button type="button" class="st-btn" id="lbs-tg" data-lbs-act="toggle"></button>';
+      card.appendChild(row); paint();
+    } catch (e) {}
+  }
+
+  async function setOn(v) {
+    S.on = !!v;
+    try { await LX._.metaSet('sync_on', S.on); } catch (e) {}
+    paint(); if (S.on) schedule(500);
+  }
+
+  function init() {
+    LX = W.LIBX;
+    LX._.metaGet('sync_on', true).then(v => { S.on = v !== false; paint(); }).catch(() => {});
+    LX.sync = {
+      run: o => reconcile(Object.assign({ force: true }, o)),
+      status: () => ({ on: S.on, loggedIn: loggedIn(), last: S.last, pushed: S.pushed, pulled: S.pulled, deleted: S.deleted, skipped: S.skipped.slice(), errs: S.errs.slice(), limits: { perLib: PER_LIB_MAX, total: TOTAL_MAX } }),
+      enable: () => setOn(true), disable: () => setOn(false), isOn: () => S.on,
+      _idbAll: idbAll, _snapshot: snapshot
+    };
+    D.addEventListener('libx:change', () => { if (!S.applying) schedule(4000); });
+    D.addEventListener('click', e => {
+      const b = e.target.closest && e.target.closest('[data-lbs-act]'); if (!b) return;
+      const a = b.getAttribute('data-lbs-act');
+      if (a === 'now') {
+        if (!loggedIn()) { say('Hãy đăng nhập ở ☁ Tài khoản để đồng bộ kho'); return; }
+        say('Đang đồng bộ kho…');
+        reconcile({ force: true }).then(r => say(r && r.errs && r.errs.length ? 'Đồng bộ kho có lỗi: ' + r.errs[0] : 'Đã đồng bộ kho (gửi ' + ((r && r.pushed) || 0) + ', nhận ' + ((r && r.pulled) || 0) + ')'));
+      } else if (a === 'toggle') { setOn(!S.on).then(() => say(S.on ? 'Đã bật đồng bộ kho' : 'Đã tắt đồng bộ kho')); }
+    });
+    // Phát hiện thay đổi: cfsync ghi mục mới vào dc-libsync, hoặc thay đổi cài đặt (metaSet không phát sự kiện)
+    setInterval(async () => {
+      try {
+        if (!S.on || D.hidden || S.running || !loggedIn()) return;
+        const sig = sigOf(await idbAll()), mh = h53(JSON.stringify(await metaObj()));
+        if (sig !== S.sig || mh !== S.mh) schedule(600);
+      } catch (e) {}
+    }, 20000);
+    D.addEventListener('visibilitychange', () => { if (!D.hidden) schedule(1500); });
+    W.addEventListener('online', () => schedule(1500));
+    try { let t = 0; new MutationObserver(() => { if (t) return; t = setTimeout(() => { t = 0; addRow(); }, 300); }).observe(D.body, { childList: true, subtree: true }); addRow(); } catch (e) {}
+    setTimeout(() => schedule(0), 6000);   // chờ cfsync đồng bộ lần đầu xong rồi mới đối chiếu
+  }
+
+  waitReady(() => W.LIBX && W.LIBX._ && W.LIBX.export && W.LIBX.import, init, () => say('Kho thư viện chưa sẵn sàng'));
+})();
+</script>
